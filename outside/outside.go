@@ -1,4 +1,3 @@
-// cot_market project resource.go
 package main
 
 import (
@@ -10,7 +9,6 @@ import (
 	"net"
 	"os"
 	"runtime"
-	"sync"
 	"time"
 
 	"github.com/fixiong/tunnel/common"
@@ -24,30 +22,11 @@ type Configure struct {
 	Secret     string
 }
 
-type Content struct {
-	Buf       []byte
-	CloseFlag bool
-}
-
-type Tunnel struct {
-	ReciveChan   chan Content
-	ReciveBuffer []byte
-}
-
-type Pack struct {
-	Tunnel  uint64
-	Content []byte
-}
-
 var (
-	tunnelCount = uint64(1)
-	tunnelMap   map[uint64]*Tunnel
-	tunnelLock  sync.Mutex
-	sendChan    = make(chan Pack)
-	reciveChan  = make(chan Pack)
-	exit        chan struct{}
-	loger       *log.Logger
-	config      = new(Configure)
+	sendChan = make(chan common.Pack)
+	exit     chan struct{}
+	loger    *log.Logger
+	config   = new(Configure)
 )
 
 func fatal(err interface{}, where string) {
@@ -97,56 +76,6 @@ func main() {
 
 }
 
-func newTunnel() (tunnelId uint64, tunnel *Tunnel) {
-	tunnelLock.Lock()
-	defer tunnelLock.Unlock()
-
-	tunnelId = tunnelCount
-	tunnelCount++
-
-	tunnelMap[tunnelId] = &Tunnel{
-		ReciveChan:   make(chan Content),
-		ReciveBuffer: make([]byte, 4096),
-	}
-	return
-}
-
-func deleteTunnel(tunnelId uint64) {
-	tunnelLock.Lock()
-	defer tunnelLock.Unlock()
-
-	delete(tunnelMap, tunnelId)
-}
-
-func closeTunnel(tunnelId uint64) {
-	tunnelLock.Lock()
-	defer tunnelLock.Unlock()
-
-	tunnel, ok := tunnelMap[tunnelId]
-	if !ok {
-		return
-	}
-
-	tunnel.ReciveChan <- Content{
-		CloseFlag: true,
-	}
-}
-
-func sendContent(tunnelId uint64, content []byte) error {
-	tunnelLock.Lock()
-	defer tunnelLock.Unlock()
-
-	tunnel, ok := tunnelMap[tunnelId]
-	if !ok {
-		return errors.New(common.CErrClosed)
-	}
-
-	tunnel.ReciveChan <- Content{
-		Buf: content,
-	}
-	return nil
-}
-
 func downServer() {
 	listener, err := net.Listen("tcp", ":"+config.DownPort)
 	check(err)
@@ -157,7 +86,6 @@ func downServer() {
 		}()
 
 		heartbeatChan := make(chan struct{})
-		var sending *Pack
 
 		go func() {
 			for {
@@ -186,32 +114,9 @@ func downServer() {
 					return
 				}
 
-				for {
-					if sending == nil {
-						select {
-						case pack := <-sendChan:
-							sending = &pack
-						case <-heartbeatChan:
-							err = common.PutPack(conn, 0, nil)
-							if err != nil {
-								return
-							}
-							continue
-						}
-					}
-					err = common.PutPack(conn, sending.Tunnel, sending.Content)
-					if err != nil {
-						if err.Error() == common.CErrClosed {
-							err = nil
-							closeTunnel(sending.Tunnel)
-						} else {
-							return
-
-						}
-					}
-					sending = nil
-				}
-			}
+				common.OutConnectionStart(conn)
+				return
+			}()
 			if err != nil {
 				loger.Println(err)
 			}
@@ -250,25 +155,33 @@ func upServer() {
 
 				for {
 					err = func() (err error) {
-						tunnel, content, err := common.GetPack(conn)
+						pack, err := common.GetPack(conn)
 						if err != nil {
 							common.PutReply(conn, err)
 							return
 						}
-						if len(content) == 0 {
-							err = common.PutReply(conn, nil)
-							return
+						switch pack.Command {
+						case common.CCommandCreate:
+							err = errors.New("wrong create tunnel!")
+						case common.CCommandDelete:
+							closeTunnel(pack.Tunnel)
+						case common.CCommandData:
+							err = sendContent(pack.Tunnel, pack.Content)
+						case common.CCommandHeartbeat:
+						default:
+							err = errors.New("wrong command!")
 						}
-
-						common.PutReply(conn, sendContent(tunnel, content))
+						err1 := common.PutReply(conn, err)
+						if err == nil {
+							err = err1
+						}
 						return
 					}()
 					if err != nil {
 						return
 					}
 				}
-				return
-			}
+			}()
 			if err != nil {
 				loger.Println(err)
 			}
@@ -293,7 +206,7 @@ func publicServer() {
 				defer func() {
 					conn.Close()
 					err := recover()
-					fatal(err, "publicServer send func")
+					fatal(err, "publicServer connection func")
 				}()
 
 				tunnelId, tunnel := newTunnel()
@@ -306,9 +219,71 @@ func publicServer() {
 						fatal(err, "publicServer recive func ")
 					}()
 
-					reciveSignal <- struct{}{}
+					sendChan <- common.Pack{
+						Tunnel:  tunnelId,
+						Command: common.CCommandCreate,
+					}
 
-					conn.Read(tunnel.ReciveBuffer)
+					for {
+						if len(tunnel.FrontBuffer) == 0 {
+							size := 4096
+							tunnel.FrontBuffer = make([]byte, size)
+						}
+						n, err := conn.Read(tunnel.FrontBuffer)
+						if n != 0 {
+							sendChan <- common.Pack{
+								Tunnel:  tunnelId,
+								Content: tunnel.FrontBuffer[:n],
+							}
+							if n == len(tunnel.FrontBuffer) && n*2 < int(common.MaxSize) {
+								tunnel.FrontBuffer = make([]byte, n*2)
+							}
+							tunnel.flip()
+						}
+						if err == nil {
+							continue
+						}
+						if err != io.EOF {
+							loger.Println(err)
+						}
+						break
+					}
+					reciveSignal <- struct{}{}
+				}()
+
+				sendSignal := make(chan struct{})
+				go func() {
+					defer func() {
+						err := recover()
+						fatal(err, "publicServer send func ")
+					}()
+
+					for {
+						content := <-tunnel.ReciveChan
+						if content.CloseFlag {
+							break
+						}
+
+						n, err := conn.Read(tunnel.ReciveBuffer)
+						if n != 0 {
+							sendChan <- Pack{
+								Tunnel:  tunnelId,
+								Content: tunnel.ReciveBuffer[:n],
+							}
+						}
+						if n == len(tunnel.ReciveBuffer) && n*2 < int(common.MaxSize) {
+							tunnel.ReciveBuffer = make([]byte, n*2)
+						}
+						if err == nil {
+							continue
+						}
+						if err != io.EOF {
+							loger.Println(err)
+						}
+						break
+					}
+					sendSignal <- struct{}{}
+
 				}()
 
 				<-reciveSignal
