@@ -3,14 +3,17 @@ package tunnel
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 )
 
 var (
-	MaxSize      = uint32(10000000)
-	ReplyMaxSize = uint32(4096)
+	MaxSize        = uint32(10000000)
+	ErrMaxSize     = uint32(4096)
+	CommandMaxSize = uint32(4096)
 
+	headerCreate    = toInt("crea")
 	headerData      = toInt("data")
 	headerRead      = toInt("read")
 	headerHeartbeat = toInt("htbt")
@@ -21,104 +24,129 @@ func toInt(s string) uint32 {
 	return binary.LittleEndian.Uint32([]byte(s))
 }
 
-type tunnel struct {
-	readCount uint32
-	sendChan  chan uint32
-	outSignal chan uint32
-	inSignal  chan struct{}
-	inBuffer  []byte
-	inNumber  uint32
-}
-
-func (this *tunnel) readToBuffer(inNumber uint32, size int, conn io.Reader) (err error) {
-
-	select {
-	case <-this.inSignal:
-
-		this.inNumber = inNumber
-		if len(this.inBuffer) < size {
-			this.inBuffer = make([]byte, size)
-		}
-		_, err = io.ReadFull(conn, this.inBuffer)
-		if err != nil {
-			return
-		}
-
-	default:
-		err = errors.New("read data not flushed!")
-		return
-	}
-
-	return
-}
-
 type pack struct {
-	header  uint32
-	number  uint32
-	tunnel  uint64
-	content []byte
+	data    []byte
+	readNum uint32
+}
+
+type tunnel struct {
+	inEmptyBuf chan pack
+	inFullBuf  chan pack
+	inReadNum  chan uint32
+	inErr      chan error
 }
 
 type TunnelSet struct {
-	count    uint64
-	set      map[uint64]*tunnel
-	lock     sync.Mutex
-	creater  func() (io.ReadWriteCloser, error)
-	sendChan chan pack
-	sending  pack
+	tunnelLock  sync.Mutex
+	count       uint64
+	set         map[uint64]*tunnel
+	creater     func(string) (io.ReadWriteCloser, error)
+	outConnLock sync.Mutex
+	outSendLock sync.Mutex
+	outConn     io.Writer
+	outErr      chan error
+	closeChan   chan uint64
 }
 
-type Connection struct {
-	set       *TunnelSet
-	errSignal chan error
-	conn      io.ReadWriter
-}
-
-func CreateTunnelSet(creater func() (io.ReadWriteCloser, error)) *TunnelSet {
-	return &TunnelSet{
-		count:    1,
-		set:      make(map[uint64]*tunnel),
-		creater:  creater,
-		sendChan: make(chan pack),
+func (this *TunnelSet) createTunnel() (t *tunnel) {
+	t = &tunnel{
+		inEmptyBuf: make(chan pack, 1),
+		inFullBuf:  make(chan pack, 1),
+		inReadNum:  make(chan uint32, 1),
+		inErr:      make(chan error, 1),
 	}
-}
-
-func CreateConnection(set *TunnelSet, conn io.ReadWriter) (tunnelConn *Connection) {
-	tunnelConn = &Connection{
-		set:       set,
-		errSignal: make(chan error),
-		conn:      conn,
+	t.inEmptyBuf <- pack{
+		data: make([]byte, 4096),
 	}
+
 	return
 }
 
-func (this *TunnelSet) RunTunnel(conn io.ReadWriter) (err error) {
-	t := this.createMasterTunnel(conn)
+func (this *TunnelSet) sendError(tunnelId uint64, sendErr error) {
+	this.outSendLock.Lock()
+	defer this.outSendLock.Unlock()
+	var err error
+	defer func() {
+		if err != nil {
+			this.outErr <- err
+		}
+	}()
 
+	err = binary.Write(this.outConn, binary.LittleEndian, headerError)
+	if err != nil {
+		return
+	}
+
+	err = binary.Write(this.outConn, binary.LittleEndian, tunnelId)
+	if err != nil {
+		return
+	}
+
+	buf := []byte(sendErr.Error())
+	if len(buf) > int(ErrMaxSize) {
+		buf = buf[:ErrMaxSize]
+	}
+	err = binary.Write(this.outConn, binary.LittleEndian, uint32(len(buf)))
+	if err != nil {
+		return
+	}
+	_, err = this.outConn.Write(buf)
+}
+
+func (this *TunnelSet) sendData(p pack, tunnelId uint64) {
+	this.outSendLock.Lock()
+	defer this.outSendLock.Unlock()
+	var err error
+	defer func() {
+		if err != nil {
+			this.outErr <- err
+		}
+	}()
+
+	err = binary.Write(this.outConn, binary.LittleEndian, headerData)
+	if err != nil {
+		return
+	}
+
+	err = binary.Write(this.outConn, binary.LittleEndian, p.readNum)
+	if err != nil {
+		return
+	}
+
+	if len(p.data) > int(MaxSize) {
+		panic("pack too large!")
+	}
+
+	err = binary.Write(this.outConn, binary.LittleEndian, uint32(len(p.data)))
+	if err != nil {
+		return
+	}
+	_, err = this.outConn.Write(p.data)
+}
+
+func (this *TunnelSet) runTunnel(conn io.ReadWriter, tunnelId uint64, t *tunnel) (err error) {
 	reciveSignal := make(chan error)
 	go func() {
-		buffer := make([]byte, 4096)
+		var err error
+		p := pack{
+			data: make([]byte, 4096),
+		}
 		for {
-			n, err := conn.Read(buffer)
+			p.readNum = <-t.inReadNum
+
+			n, err := conn.Read(p.data)
 			if n != 0 {
-				sendChan <- common.Pack{
-					Tunnel:  tunnelId,
-					Content: tunnel.FrontBuffer[:n],
-				}
-				if n == len(tunnel.FrontBuffer) && n*2 < int(common.MaxSize) {
-					tunnel.FrontBuffer = make([]byte, n*2)
-				}
-				tunnel.flip()
+				this.sendData(p, tunnelId)
 			}
 			if err == nil {
-				continue
+				break
 			}
 			if err != io.EOF {
 				loger.Println(err)
 			}
 			break
 		}
-		reciveSignal <- struct{}{}
+		reciveSignal <- err
 	}()
 
 	sendSignal := make(chan struct{})
@@ -159,7 +187,208 @@ func (this *TunnelSet) RunTunnel(conn io.ReadWriter) (err error) {
 	<-reciveSignal
 }
 
-func (this *TunnelSet) createMasterTunnel(conn io.ReadWriteCloser) *tunnel {
+func (this *TunnelSet) CreateMasterTunnel() (t *tunnel) {
+	if this.creater != nil {
+		panic("need master tunnelSet!")
+	}
+	tunnelId := this.count
+	this.count++
+
+	return
+}
+
+func CreateTunnelSet(creater func(string) (io.ReadWriteCloser, error)) (this *TunnelSet) {
+	this = &TunnelSet{
+		count:   1,
+		set:     make(map[uint64]*tunnel),
+		creater: creater,
+	}
+	this.outSendLock.Lock()
+	return
+}
+
+func (this *TunnelSet) Connect(conn io.ReadWriter) (err error) {
+	this.outConnLock.Lock()
+	defer this.outConnLock.Unlock()
+	this.outConn = conn
+	this.outErr = make(chan error)
+	this.outSendLock.Unlock()
+	defer this.outSendLock.Lock()
+	defer close(this.outErr)
+
+	for {
+
+		select {
+		case id := <-this.closeChan:
+			delete(this.set, id)
+		case err = <-this.outErr:
+			return
+		default:
+		}
+
+		var header uint32
+		err = binary.Read(conn, binary.LittleEndian, &header)
+		if err != nil {
+			return
+		}
+
+		var tunnelId uint64
+		err = binary.Read(conn, binary.LittleEndian, &tunnelId)
+		if err != nil {
+			return
+		}
+
+		switch header {
+		case headerHeartbeat:
+			continue
+		case headerCreate:
+			var length uint32
+			err = binary.Read(conn, binary.LittleEndian, &length)
+			if err != nil {
+				return
+			}
+			if length > CommandMaxSize {
+				err = errors.New("command too large!")
+				return
+			}
+
+			cmdbuf := make([]byte, length)
+			_, err = io.ReadFull(conn, cmdbuf)
+			if err != nil {
+				return
+			}
+
+			if this.creater == nil {
+				err = errors.New("not slave tunnelSet!")
+				return
+			}
+
+			subConn, subErr := this.creater(string(cmdbuf))
+			if subErr != nil {
+				go func() {
+					this.sendError(tunnelId, subErr)
+				}()
+			} else {
+				t := this.set[tunnelId]
+				if t != nil {
+					select {
+					case t.inErr <- errors.New("tunnel overwrited!"):
+					default:
+					}
+				}
+				t = this.createTunnel()
+				this.set[tunnelId] = t
+				go func() {
+					t.run(subConn)
+				}()
+			}
+
+		case headerRead:
+			var readNum uint32
+			err = binary.Read(conn, binary.LittleEndian, &readNum)
+			if err != nil {
+				return
+			}
+
+			t := this.set[tunnelId]
+			if t == nil {
+				go func() {
+					this.sendError(tunnelId, errors.New("read tunnel not found!"))
+				}()
+			} else {
+				select {
+				case t.inReadNum <- readNum:
+				default:
+					fmt.Println("readNum duplicated!")
+				}
+			}
+
+		case headerData:
+			var readNum uint32
+			err = binary.Read(conn, binary.LittleEndian, &readNum)
+			if err != nil {
+				return
+			}
+
+			var length uint32
+			err = binary.Read(conn, binary.LittleEndian, &length)
+			if err != nil {
+				return
+			}
+			if length > MaxSize {
+				err = errors.New("pack too large!")
+				return
+			}
+
+			t := this.set[tunnelId]
+			if t == nil {
+				go func() {
+					this.sendError(tunnelId, errors.New("read tunnel not found!"))
+				}()
+			} else {
+				select {
+				case p := <-t.inEmptyBuf:
+
+					if len(p.data) < int(length) {
+						p.data = make([]byte, length)
+					}
+
+					_, err = io.ReadFull(conn, p.data)
+					if err != nil {
+						return
+					}
+					p.readNum = readNum
+
+					select {
+					case t.inFullBuf <- p:
+
+					default:
+
+						select {
+						case t.inEmptyBuf <- p:
+						default:
+						}
+
+						fmt.Println("buffer chan full!")
+					}
+				default:
+
+					buf := make([]byte, length)
+					_, err = io.ReadFull(conn, buf)
+					if err != nil {
+						return
+					}
+					fmt.Println("out of buffer!")
+				}
+			}
+		case headerError:
+			var length uint32
+			err = binary.Read(conn, binary.LittleEndian, &length)
+			if err != nil {
+				return
+			}
+			if length > ErrMaxSize {
+				err = errors.New("err too large!")
+				return
+			}
+			errbuf := make([]byte, length)
+			_, err = io.ReadFull(conn, errbuf)
+			if err != nil {
+				return
+			}
+
+			t := this.set[tunnelId]
+			if t != nil {
+				select {
+				case t.inErr <- errors.New(string(errbuf)):
+				default:
+				}
+			}
+		}
+	}
+}
+
+func (this *TunnelSet) createMasterTunnel() *tunnel {
 	this.lock.Lock()
 	defer this.lock.Unlock()
 	tunnelId := this.count
@@ -172,29 +401,6 @@ func (this *TunnelSet) createMasterTunnel(conn io.ReadWriteCloser) *tunnel {
 	this.dataChan <- pack{
 		header: headerRead,
 	}
-	return
-}
-
-func (this *Connection) getTunnel(create bool) (t *tunnel, err error) {
-	var tunnelId uint64
-	err = binary.Read(this.conn, binary.LittleEndian, &tunnelId)
-	if err != nil {
-		return
-	}
-
-	this.set.lock.Lock()
-	defer this.set.lock.Unlock()
-
-	t, ok := this.set.set[tunnelId]
-	if ok {
-		return
-	}
-	if !create {
-		err = errors.New("tunnel not found!")
-		return
-	}
-
-	t = this.set.createTunnel(tunnelId)
 	return
 }
 
@@ -303,23 +509,6 @@ func (this *Connection) putPack(p pack) (err error) {
 		_, err = this.conn.Write(p.content)
 	}
 	return
-}
-
-func (this *Connection) Run() (err error) {
-	for {
-		if this.set.sending.header != 0 {
-			err = this.putPack(this.set.sending)
-			if err != nil {
-				return
-			}
-			this.set.sending = pack{}
-		}
-		select {
-		case err = <-this.errSignal:
-			return err
-		case this.set.sending = <-this.set.sendChan:
-		}
-	}
 }
 
 func (this *TunnelConnection) CreateTunnel(conn io.ReadWriteCloser) (tunnelId uint64) {
