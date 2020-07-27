@@ -9,15 +9,17 @@ import (
 )
 
 var (
-	MaxSize        = uint32(10000000)
-	ErrMaxSize     = uint32(4096)
-	CommandMaxSize = uint32(4096)
+	MaxDataSize    = uint32(10000000)
+	MaxMessageSize = uint32(4096)
 
-	headerCreate    = toInt("crea")
-	headerData      = toInt("data")
-	headerRead      = toInt("read")
-	headerHeartbeat = toInt("htbt")
-	headerError     = toInt("erro")
+	cHeaderCreate  = toInt("crea")
+	cHeaderData    = toInt("data")
+	cHeaderRead    = toInt("read")
+	cHeaderReRead  = toInt("rere")
+	cHeaderMessage = toInt("mesg")
+
+	cMessageError = byte(1)
+	cMessageState = byte(2)
 )
 
 func toInt(s string) uint32 {
@@ -25,13 +27,19 @@ func toInt(s string) uint32 {
 }
 
 type pack struct {
-	data    []byte
 	readNum uint32
+	data    []byte
+}
+
+type message struct {
+	msgType byte
+	data    []byte
 }
 
 type tunnel struct {
 	inEmptyBuf chan pack
 	inFullBuf  chan pack
+	inMessage  chan message
 	inReadNum  chan uint32
 	inErr      chan error
 }
@@ -46,20 +54,74 @@ type TunnelSet struct {
 	outConn     io.Writer
 	outErr      chan error
 	closeChan   chan uint64
+	messagePool chan message
 }
 
 func (this *TunnelSet) createTunnel() (t *tunnel) {
 	t = &tunnel{
 		inEmptyBuf: make(chan pack, 1),
 		inFullBuf:  make(chan pack, 1),
+		inMessage:  make(chan message, 256),
 		inReadNum:  make(chan uint32, 1),
-		inErr:      make(chan error, 1),
 	}
 	t.inEmptyBuf <- pack{
 		data: make([]byte, 4096),
 	}
 
 	return
+}
+
+func (this *TunnelSet) CreateMasterTunnel() (t *tunnel) {
+	if this.creater != nil {
+		panic("need master tunnelSet!")
+	}
+	tunnelId := this.count
+	this.count++
+
+	return
+}
+
+func CreateTunnelSet(creater func(string) (io.ReadWriteCloser, error)) (this *TunnelSet) {
+	this = &TunnelSet{
+		count:       1,
+		set:         make(map[uint64]*tunnel),
+		creater:     creater,
+		closeChan:   make(chan uint64),
+		messagePool: make(chan message, 4096),
+	}
+	this.outSendLock.Lock()
+	return
+}
+
+func (this *TunnelSet) sendMessage(tunnelId uint64, mtype byte, msg string) {
+	this.outSendLock.Lock()
+	defer this.outSendLock.Unlock()
+	var err error
+	defer func() {
+		if err != nil {
+			this.outErr <- err
+		}
+	}()
+
+	err = binary.Write(this.outConn, binary.LittleEndian, headerError)
+	if err != nil {
+		return
+	}
+
+	err = binary.Write(this.outConn, binary.LittleEndian, tunnelId)
+	if err != nil {
+		return
+	}
+
+	buf := []byte(sendErr.Error())
+	if len(buf) > int(ErrMaxSize) {
+		buf = buf[:ErrMaxSize]
+	}
+	err = binary.Write(this.outConn, binary.LittleEndian, uint32(len(buf)))
+	if err != nil {
+		return
+	}
+	_, err = this.outConn.Write(buf)
 }
 
 func (this *TunnelSet) sendError(tunnelId uint64, sendErr error) {
@@ -185,26 +247,6 @@ func (this *TunnelSet) runTunnel(conn io.ReadWriter, tunnelId uint64, t *tunnel)
 	}()
 
 	<-reciveSignal
-}
-
-func (this *TunnelSet) CreateMasterTunnel() (t *tunnel) {
-	if this.creater != nil {
-		panic("need master tunnelSet!")
-	}
-	tunnelId := this.count
-	this.count++
-
-	return
-}
-
-func CreateTunnelSet(creater func(string) (io.ReadWriteCloser, error)) (this *TunnelSet) {
-	this = &TunnelSet{
-		count:   1,
-		set:     make(map[uint64]*tunnel),
-		creater: creater,
-	}
-	this.outSendLock.Lock()
-	return
 }
 
 func (this *TunnelSet) Connect(conn io.ReadWriter) (err error) {
