@@ -14,12 +14,11 @@ var (
 
 	cHeaderCreate  = toInt("crea")
 	cHeaderData    = toInt("data")
-	cHeaderRead    = toInt("read")
-	cHeaderReRead  = toInt("rere")
 	cHeaderMessage = toInt("mesg")
 
 	cMessageError = byte(1)
 	cMessageState = byte(2)
+	cMessageRead  = byte(3)
 )
 
 func toInt(s string) uint32 {
@@ -40,8 +39,6 @@ type tunnel struct {
 	inEmptyBuf chan pack
 	inFullBuf  chan pack
 	inMessage  chan message
-	inReadNum  chan uint32
-	inErr      chan error
 }
 
 type TunnelSet struct {
@@ -52,7 +49,6 @@ type TunnelSet struct {
 	outConnLock sync.Mutex
 	outSendLock sync.Mutex
 	outConn     io.Writer
-	outErr      chan error
 	closeChan   chan uint64
 	messagePool chan message
 }
@@ -62,7 +58,6 @@ func (this *TunnelSet) createTunnel() (t *tunnel) {
 		inEmptyBuf: make(chan pack, 1),
 		inFullBuf:  make(chan pack, 1),
 		inMessage:  make(chan message, 256),
-		inReadNum:  make(chan uint32, 1),
 	}
 	t.inEmptyBuf <- pack{
 		data: make([]byte, 4096),
@@ -93,17 +88,11 @@ func CreateTunnelSet(creater func(string) (io.ReadWriteCloser, error)) (this *Tu
 	return
 }
 
-func (this *TunnelSet) sendMessage(tunnelId uint64, mtype byte, msg string) {
+func (this *TunnelSet) sendMessage(tunnelId uint64, mtype byte, msg string) (err error) {
 	this.outSendLock.Lock()
 	defer this.outSendLock.Unlock()
-	var err error
-	defer func() {
-		if err != nil {
-			this.outErr <- err
-		}
-	}()
 
-	err = binary.Write(this.outConn, binary.LittleEndian, headerError)
+	err = binary.Write(this.outConn, binary.LittleEndian, cHeaderMessage)
 	if err != nil {
 		return
 	}
@@ -113,59 +102,28 @@ func (this *TunnelSet) sendMessage(tunnelId uint64, mtype byte, msg string) {
 		return
 	}
 
-	buf := []byte(sendErr.Error())
-	if len(buf) > int(ErrMaxSize) {
-		buf = buf[:ErrMaxSize]
+	err = binary.Write(this.outConn, binary.LittleEndian, mtype)
+	if err != nil {
+		return
+	}
+
+	buf := []byte(msg)
+	if len(buf) > int(MaxMessageSize) {
+		buf = buf[:MaxMessageSize]
 	}
 	err = binary.Write(this.outConn, binary.LittleEndian, uint32(len(buf)))
 	if err != nil {
 		return
 	}
 	_, err = this.outConn.Write(buf)
+	return
 }
 
-func (this *TunnelSet) sendError(tunnelId uint64, sendErr error) {
+func (this *TunnelSet) sendData(p pack, tunnelId uint64) (err error) {
 	this.outSendLock.Lock()
 	defer this.outSendLock.Unlock()
-	var err error
-	defer func() {
-		if err != nil {
-			this.outErr <- err
-		}
-	}()
 
-	err = binary.Write(this.outConn, binary.LittleEndian, headerError)
-	if err != nil {
-		return
-	}
-
-	err = binary.Write(this.outConn, binary.LittleEndian, tunnelId)
-	if err != nil {
-		return
-	}
-
-	buf := []byte(sendErr.Error())
-	if len(buf) > int(ErrMaxSize) {
-		buf = buf[:ErrMaxSize]
-	}
-	err = binary.Write(this.outConn, binary.LittleEndian, uint32(len(buf)))
-	if err != nil {
-		return
-	}
-	_, err = this.outConn.Write(buf)
-}
-
-func (this *TunnelSet) sendData(p pack, tunnelId uint64) {
-	this.outSendLock.Lock()
-	defer this.outSendLock.Unlock()
-	var err error
-	defer func() {
-		if err != nil {
-			this.outErr <- err
-		}
-	}()
-
-	err = binary.Write(this.outConn, binary.LittleEndian, headerData)
+	err = binary.Write(this.outConn, binary.LittleEndian, cHeaderData)
 	if err != nil {
 		return
 	}
@@ -175,7 +133,7 @@ func (this *TunnelSet) sendData(p pack, tunnelId uint64) {
 		return
 	}
 
-	if len(p.data) > int(MaxSize) {
+	if len(p.data) > int(MaxDataSize) {
 		panic("pack too large!")
 	}
 
@@ -184,69 +142,93 @@ func (this *TunnelSet) sendData(p pack, tunnelId uint64) {
 		return
 	}
 	_, err = this.outConn.Write(p.data)
+	return
+}
+
+type readInfo struct {
+	rType  uint32
+	number uint32
 }
 
 func (this *TunnelSet) runTunnel(conn io.ReadWriter, tunnelId uint64, t *tunnel) (err error) {
-	reciveSignal := make(chan error)
+	readChan := make(chan readInfo, 1)
 	go func() {
-		var err error
 		p := pack{
-			data: make([]byte, 4096),
+			data:    make([]byte, 4096),
+			readNum: 0,
 		}
+		var n int
 		for {
-			p.readNum = <-t.inReadNum
+			info := <-readChan
 
-			n, err := conn.Read(p.data)
-			if n != 0 {
-				this.sendData(p, tunnelId)
-			}
-			if err == nil {
-				break
-			}
-			if err != io.EOF {
-				loger.Println(err)
-			}
-			break
-		}
-		reciveSignal <- err
-	}()
-
-	sendSignal := make(chan struct{})
-	go func() {
-		defer func() {
-			err := recover()
-			fatal(err, "publicServer send func ")
-		}()
-
-		for {
-			content := <-tunnel.ReciveChan
-			if content.CloseFlag {
-				break
-			}
-
-			n, err := conn.Read(tunnel.ReciveBuffer)
-			if n != 0 {
-				sendChan <- Pack{
-					Tunnel:  tunnelId,
-					Content: tunnel.ReciveBuffer[:n],
+			if p.readNum != info.number {
+				n, err = conn.Read(p.data)
+				p.readNum = info.number
+				if err != nil {
+					if n != 0 {
+						this.sendData(p, tunnelId)
+					}
+					if err != io.EOF {
+						fmt.Println(err)
+					}
+					return
 				}
 			}
-			if n == len(tunnel.ReciveBuffer) && n*2 < int(common.MaxSize) {
-				tunnel.ReciveBuffer = make([]byte, n*2)
+
+			if n != 0 {
+				err1 := this.sendData(p, tunnelId)
+				for err1 != nil {
+					fmt.Println(err1)
+					err1 = this.sendData(p, tunnelId)
+				}
+				if n == len(p.data) && n < int(MaxDataSize) {
+					p.data = make([]byte, n*2)
+				}
 			}
-			if err == nil {
-				continue
-			}
-			if err != io.EOF {
-				loger.Println(err)
-			}
-			break
 		}
-		sendSignal <- struct{}{}
+	}()
+
+	go func() {
+		readNum := uint32(1)
+		for {
+			err1 := this.sendMessage(tunnelId, cMessageRead, "")
+			for err1 != nil {
+				fmt.Println(err1)
+				err1 = this.sendMessage(tunnelId, cMessageRead, "")
+			}
+			p := <-t.inFullBuf
+			_, err := conn.Write(p.data)
+			if err != nil {
+				if err != io.EOF {
+					fmt.Println(err)
+				}
+				return
+			}
+		}
 
 	}()
 
-	<-reciveSignal
+	for {
+		msg := <-t.inMessage
+
+		switch msg.msgType {
+		case cMessageError:
+			m := string(msg.data)
+			if m != "Eof" {
+				fmt.Println(m)
+			}
+			return
+		case cMessageRead:
+			readChan <- readInfo{
+				number: binary.LittleEndian.Uint32(msg.data),
+			}
+		case cMessageState:
+
+		}
+
+		this.messagePool <- msg
+	}
+
 }
 
 func (this *TunnelSet) Connect(conn io.ReadWriter) (err error) {
