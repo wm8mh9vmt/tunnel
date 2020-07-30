@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"time"
 )
 
 var (
@@ -88,7 +89,7 @@ func CreateTunnelSet(creater func(string) (io.ReadWriteCloser, error)) (this *Tu
 	return
 }
 
-func (this *TunnelSet) sendMessage(tunnelId uint64, mtype byte, msg string) (err error) {
+func (this *TunnelSet) sendMessage(tunnelId uint64, mtype byte, buf []byte) (err error) {
 	this.outSendLock.Lock()
 	defer this.outSendLock.Unlock()
 
@@ -107,7 +108,6 @@ func (this *TunnelSet) sendMessage(tunnelId uint64, mtype byte, msg string) (err
 		return
 	}
 
-	buf := []byte(msg)
 	if len(buf) > int(MaxMessageSize) {
 		buf = buf[:MaxMessageSize]
 	}
@@ -119,7 +119,7 @@ func (this *TunnelSet) sendMessage(tunnelId uint64, mtype byte, msg string) (err
 	return
 }
 
-func (this *TunnelSet) sendData(p pack, tunnelId uint64) (err error) {
+func (this *TunnelSet) sendData(tunnelId uint64, p pack) (err error) {
 	this.outSendLock.Lock()
 	defer this.outSendLock.Unlock()
 
@@ -145,6 +145,35 @@ func (this *TunnelSet) sendData(p pack, tunnelId uint64) (err error) {
 	return
 }
 
+func (this *TunnelSet) sendDataLoop(tunnelId uint64, p pack) {
+	err := this.sendData(tunnelId, p)
+	for err != nil {
+		fmt.Println(err)
+		time.Sleep(time.Second)
+		err = this.sendData(tunnelId, p)
+	}
+}
+
+func (this *TunnelSet) sendErrorLoop(tunnelId uint64, sendErr error) {
+	err := this.sendMessage(tunnelId, cMessageError, []byte(sendErr.Error()))
+	for err != nil {
+		fmt.Println(err)
+		time.Sleep(time.Second)
+		err1 := this.sendMessage(tunnelId, cMessageError, []byte(sendErr.Error()))
+	}
+}
+
+func (this *TunnelSet) sendReadLoop(tunnelId uint64, stat uint32) {
+	var buf [4]byte
+	binary.LittleEndian.PutUint32(buf[:], stat)
+	err := this.sendMessage(tunnelId, cMessageRead, buf[:])
+	for err != nil {
+		fmt.Println(err)
+		time.Sleep(time.Second)
+		err = this.sendMessage(tunnelId, cMessageRead, buf[:])
+	}
+}
+
 type readInfo struct {
 	rType  uint32
 	number uint32
@@ -152,57 +181,100 @@ type readInfo struct {
 
 func (this *TunnelSet) runTunnel(conn io.ReadWriter, tunnelId uint64, t *tunnel) (err error) {
 	readChan := make(chan readInfo, 1)
+	defer close(readChan)
+	next_stat := func(stat uint32) {
+		time.Sleep(time.Second * 10)
+		readChan <- readInfo{
+			rType:  1,
+			number: stat,
+		}
+	}
 	go func() {
+		var err error
+		var n int
+		var stat bool
 		p := pack{
 			data:    make([]byte, 4096),
 			readNum: 0,
 		}
-		var n int
 		for {
 			info := <-readChan
+			if info.rType == 1 {
+				if info.number == p.readNum {
+					var msg [4]byte
+					binary.LittleEndian.PutUint32(msg[:], p.readNum)
+					err1 := this.sendMessage(tunnelId, cMessageState, msg[:])
+					if err1 != nil {
+						fmt.Println(err1)
+					}
+					go next_stat(p.readNum)
+				}
+				continue
+			}
 
 			if p.readNum != info.number {
 				n, err = conn.Read(p.data)
 				p.readNum = info.number
-				if err != nil {
-					if n != 0 {
-						this.sendData(p, tunnelId)
-					}
-					if err != io.EOF {
-						fmt.Println(err)
-					}
-					return
-				}
+				stat = false
 			}
 
 			if n != 0 {
-				err1 := this.sendData(p, tunnelId)
-				for err1 != nil {
-					fmt.Println(err1)
-					err1 = this.sendData(p, tunnelId)
+				if !stat {
+					this.sendDataLoop(tunnelId, p)
+					stat = true
 				}
+				go next_stat(p.readNum)
 				if n == len(p.data) && n < int(MaxDataSize) {
-					p.data = make([]byte, n*2)
+					ndata := make([]byte, n*2)
+					for i, c := range p.data {
+						ndata[i] = c
+					}
+					p.data = ndata
 				}
 			}
-		}
-	}()
 
-	go func() {
-		readNum := uint32(1)
-		for {
-			err1 := this.sendMessage(tunnelId, cMessageRead, "")
-			for err1 != nil {
-				fmt.Println(err1)
-				err1 = this.sendMessage(tunnelId, cMessageRead, "")
-			}
-			p := <-t.inFullBuf
-			_, err := conn.Write(p.data)
 			if err != nil {
+				this.sendErrorLoop(tunnelId, err)
 				if err != io.EOF {
 					fmt.Println(err)
 				}
 				return
+			}
+		}
+	}()
+
+	statChan := make(chan uint32)
+	defer close(statChan)
+	go func() {
+		lastReadNum := uint32(0)
+		readNum := uint32(1)
+		this.sendReadLoop(tunnelId, readNum)
+		for {
+			select {
+			case p := <-t.inFullBuf:
+				if p.readNum == readNum {
+					_, err := conn.Write(p.data)
+					if err != nil {
+						this.sendErrorLoop(tunnelId, err)
+						if err != io.EOF {
+							fmt.Println(err)
+						}
+						return
+					}
+					lastReadNum = readNum
+					readNum++
+					this.sendReadLoop(tunnelId, readNum)
+				} else {
+					if p.readNum == lastReadNum {
+						fmt.Println("recive duplicated:", p.readNum)
+					} else {
+						fmt.Println("unknown read number:", p.readNum)
+					}
+				}
+			case s := <-statChan:
+				if s == readNum {
+					this.sendReadLoop(tunnelId, readNum)
+				}
 			}
 		}
 
