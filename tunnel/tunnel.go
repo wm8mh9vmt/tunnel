@@ -50,8 +50,8 @@ type TunnelSet struct {
 	outConnLock sync.Mutex
 	outSendLock sync.Mutex
 	outConn     io.Writer
-	closeChan   chan uint64
 	messagePool chan message
+	closeChan   chan uint64
 }
 
 func (this *TunnelSet) createTunnel() (t *tunnel) {
@@ -82,11 +82,26 @@ func CreateTunnelSet(creater func(string) (io.ReadWriteCloser, error)) (this *Tu
 		count:       1,
 		set:         make(map[uint64]*tunnel),
 		creater:     creater,
-		closeChan:   make(chan uint64),
 		messagePool: make(chan message, 4096),
+		closeChan:   make(chan uint64),
 	}
 	this.outSendLock.Lock()
 	return
+}
+
+func (this *TunnelSet) newMsgBuf() (buf message) {
+	select {
+	case buf = <-this.messagePool:
+	default:
+	}
+	return
+}
+
+func (this *TunnelSet) deleteMsgBuf(buf message) {
+	select {
+	case this.messagePool <- buf:
+	default:
+	}
 }
 
 func (this *TunnelSet) sendMessage(tunnelId uint64, mtype byte, buf []byte) (err error) {
@@ -180,100 +195,34 @@ type readInfo struct {
 }
 
 type statInfo struct {
-	sType  uint32
 	number uint32
 }
 
 var (
 	cRTypeRead = uint32(1)
 	cRTypeHtbt = uint32(2)
-
-	cSTypeStat = uint32(1)
 )
 
 func (this *TunnelSet) runTunnel(conn io.ReadWriteCloser, tunnelId uint64, t *tunnel) (err error) {
+	errChan := make(chan error)
+	statChan := make(chan statInfo, 1)
+	readChan := make(chan readInfo, 1)
 	defer func() {
+		close(readChan)
+		close(statChan)
+		close(errChan)
 		close(t.inMessage)
 		close(t.inFullBuf)
 		close(t.inEmptyBuf)
 		conn.Close()
 	}()
 
-	readChan := make(chan readInfo, 1)
-	defer close(readChan)
 	go func() {
-		next_stat := func(stat uint32) {
-			time.Sleep(time.Second * 10)
-			readChan <- readInfo{
-				rType:  1,
-				number: stat,
-			}
-		}
-		var err error
-		var n int
-		p := pack{
-			data:    make([]byte, 4096),
-			readNum: 0,
-		}
-		for {
-			info := <-readChan
-			switch info.rType {
-			case cRTypeHtbt:
-				if info.number == p.readNum {
-					var msg [4]byte
-					binary.LittleEndian.PutUint32(msg[:], p.readNum)
-					err1 := this.sendMessage(tunnelId, cMessageState, msg[:])
-					if err1 != nil {
-						fmt.Println(err1)
-					}
-					go next_stat(p.readNum)
-				}
-			case cRTypeRead:
-				if p.readNum != info.number {
-					n, err = conn.Read(p.data)
-					p.readNum = info.number
-				}
-
-				if n != 0 {
-					this.sendDataLoop(tunnelId, p)
-					go next_stat(p.readNum)
-					if n == len(p.data) && n < int(MaxDataSize) {
-						ndata := make([]byte, n*2)
-						for i, c := range p.data {
-							ndata[i] = c
-						}
-						p.data = ndata
-					}
-				}
-
-				if err != nil {
-					this.sendErrorLoop(tunnelId, err)
-					if err != io.EOF {
-						fmt.Println(err)
-					}
-					return
-				}
-			default:
-				return
-			}
-		}
-	}()
-
-	statChan := make(chan statInfo, 1)
-	defer close(statChan)
-	go func() {
-		defer func() {
-			statChan <- statInfo{}
-		}()
-
 		for {
 			err := func() (err error) {
 				msg := <-t.inMessage
 				defer func() {
-					select {
-					case this.messagePool <- msg:
-					default:
-					}
+					this.deleteMsgBuf(msg)
 				}()
 
 				switch msg.msgType {
@@ -286,6 +235,7 @@ func (this *TunnelSet) runTunnel(conn io.ReadWriteCloser, tunnelId uint64, t *tu
 						return
 					}
 					readChan <- readInfo{
+						rType:  cRTypeRead,
 						number: binary.LittleEndian.Uint32(msg.data),
 					}
 				case cMessageState:
@@ -302,10 +252,63 @@ func (this *TunnelSet) runTunnel(conn io.ReadWriteCloser, tunnelId uint64, t *tu
 				}
 			}()
 			if err != nil {
-				if err.Error() != "EOF" {
-					fmt.Println(err)
+				errChan <- err
+				return
+			}
+		}
+	}()
+
+	go func() {
+		next_htbt := func(stat uint32) {
+			time.Sleep(time.Second * 10)
+			readChan <- readInfo{
+				rType:  cRTypeHtbt,
+				number: stat,
+			}
+		}
+		var n int
+		p := pack{
+			data:    make([]byte, 4096),
+			readNum: 0,
+		}
+		var msg [4]byte
+		for {
+			info := <-readChan
+			switch info.rType {
+			case cRTypeHtbt:
+				if info.number == p.readNum {
+					binary.LittleEndian.PutUint32(msg[:], p.readNum)
+					err1 := this.sendMessage(tunnelId, cMessageState, msg[:])
+					if err1 != nil {
+						fmt.Println(err1)
+					}
+					go next_htbt(p.readNum)
 				}
-				break
+			case cRTypeRead:
+				if p.readNum != info.number {
+					n, err = conn.Read(p.data)
+					p.readNum = info.number
+				}
+
+				if n != 0 {
+					this.sendDataLoop(tunnelId, p)
+					go next_htbt(p.readNum)
+					if n == len(p.data) && n < int(MaxDataSize) {
+						ndata := make([]byte, n*2)
+						for i, c := range p.data {
+							ndata[i] = c
+						}
+						p.data = ndata
+					}
+				}
+
+				if err != nil {
+					this.sendErrorLoop(tunnelId, err)
+					errChan <- err
+					return
+				}
+			default:
+				return
 			}
 		}
 	}()
@@ -314,12 +317,22 @@ func (this *TunnelSet) runTunnel(conn io.ReadWriteCloser, tunnelId uint64, t *tu
 	this.sendReadLoop(tunnelId, readNum)
 	for {
 		select {
+		case err = <-errChan:
+			select {
+			case p := <-t.inFullBuf:
+				conn.Write(p.data)
+			default:
+			}
+			if err.Error() == "EOF" {
+				err = nil
+			}
+			return
 		case p := <-t.inFullBuf:
 			if len(p.data) == 0 {
 				return
 			}
 			if p.readNum == readNum {
-				_, err := conn.Write(p.data)
+				_, err = conn.Write(p.data)
 				if err != nil {
 					this.sendErrorLoop(tunnelId, err)
 					if err != io.EOF {
@@ -333,18 +346,8 @@ func (this *TunnelSet) runTunnel(conn io.ReadWriteCloser, tunnelId uint64, t *tu
 				fmt.Println("unknown read number:", p.readNum)
 			}
 		case s := <-statChan:
-			switch s.sType {
-			case cSTypeStat:
-				if s.number == readNum {
-					this.sendReadLoop(tunnelId, readNum)
-				}
-			default:
-				select {
-				case p := <-t.inFullBuf:
-					conn.Write(p.data)
-				default:
-				}
-				return
+			if s.number == readNum {
+				this.sendReadLoop(tunnelId, readNum)
 			}
 		}
 	}
@@ -354,18 +357,13 @@ func (this *TunnelSet) Connect(conn io.ReadWriter) (err error) {
 	this.outConnLock.Lock()
 	defer this.outConnLock.Unlock()
 	this.outConn = conn
-	this.outErr = make(chan error)
 	this.outSendLock.Unlock()
 	defer this.outSendLock.Lock()
-	defer close(this.outErr)
 
 	for {
-
 		select {
 		case id := <-this.closeChan:
 			delete(this.set, id)
-		case err = <-this.outErr:
-			return
 		default:
 		}
 
@@ -382,21 +380,22 @@ func (this *TunnelSet) Connect(conn io.ReadWriter) (err error) {
 		}
 
 		switch header {
-		case headerHeartbeat:
-			continue
-		case headerCreate:
+		case cHeaderCreate:
 			var length uint32
 			err = binary.Read(conn, binary.LittleEndian, &length)
 			if err != nil {
 				return
 			}
-			if length > CommandMaxSize {
+			if length > MaxMessageSize {
 				err = errors.New("command too large!")
 				return
 			}
 
-			cmdbuf := make([]byte, length)
-			_, err = io.ReadFull(conn, cmdbuf)
+			buf := this.newMsgBuf()
+			if len(buf.data) < int(length) {
+				buf.data = make([]byte, length)
+			}
+			_, err = io.ReadFull(conn, buf.data)
 			if err != nil {
 				return
 			}
@@ -406,27 +405,35 @@ func (this *TunnelSet) Connect(conn io.ReadWriter) (err error) {
 				return
 			}
 
-			subConn, subErr := this.creater(string(cmdbuf))
+			subConn, subErr := this.creater(string(buf.data))
 			if subErr != nil {
+				this.deleteMsgBuf(buf)
 				go func() {
-					this.sendError(tunnelId, subErr)
+					this.sendErrorLoop(tunnelId, subErr)
 				}()
 			} else {
 				t := this.set[tunnelId]
 				if t != nil {
 					select {
-					case t.inErr <- errors.New("tunnel overwrited!"):
+					case t.inMessage <- buf:
 					default:
+						this.deleteMsgBuf(buf)
 					}
 				}
 				t = this.createTunnel()
 				this.set[tunnelId] = t
 				go func() {
-					t.run(subConn)
+					defer func() {
+						this.closeChan <- tunnelId
+					}()
+					err := this.runTunnel(subConn, tunnelId, t)
+					if err != nil {
+						fmt.Println(err)
+					}
 				}()
 			}
 
-		case headerRead:
+		case cHeaderRead:
 			var readNum uint32
 			err = binary.Read(conn, binary.LittleEndian, &readNum)
 			if err != nil {
