@@ -73,16 +73,6 @@ func (this *TunnelSet) createTunnel() (t *tunnel) {
 	return
 }
 
-func (this *TunnelSet) CreateMasterTunnel() (t *tunnel) {
-	if this.creater != nil {
-		panic("need master tunnelSet!")
-	}
-	tunnelId := this.count
-	this.count++
-
-	return
-}
-
 func CreateTunnelSet(creater func([]byte) (io.ReadWriteCloser, error)) (this *TunnelSet) {
 	this = &TunnelSet{
 		count:      1,
@@ -598,7 +588,9 @@ func (this *TunnelSet) Connect(conn io.ReadWriter) (err error) {
 }
 
 func (this *TunnelSet) ConnectTunnel(conn io.ReadWriteCloser, cmd []byte) (err error) {
-
+	if this.creater != nil {
+		err = errors.New("not master tunnel!")
+	}
 	if this.outConn == nil {
 		err = ErrNoConnection
 		return
