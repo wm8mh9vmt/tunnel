@@ -19,6 +19,9 @@ var (
 	cHeaderError  = toInt("erro")
 	cHeaderStat   = toInt("stat")
 	cHeaderRead   = toInt("read")
+
+	errNotFound     = errors.New("tunnel not found!")
+	ErrNoConnection = errors.New("no connection!")
 )
 
 func toInt(s string) uint32 {
@@ -27,6 +30,7 @@ func toInt(s string) uint32 {
 
 type pack struct {
 	readNum uint32
+	size    uint32
 	data    []byte
 }
 
@@ -44,13 +48,13 @@ type tunnel struct {
 type TunnelSet struct {
 	tunnelLock  sync.Mutex
 	count       uint64
-	set         map[uint64]*tunnel
-	creater     func(string) (io.ReadWriteCloser, error)
+	tunnelMap   sync.Map
+	creater     func([]byte) (io.ReadWriteCloser, error)
 	outConnLock sync.Mutex
 	outSendLock sync.Mutex
 	outConn     io.Writer
 	bufferPool  chan []byte
-	closeChan   chan uint64
+	DummyBuf    []byte
 }
 
 func (this *TunnelSet) createTunnel() (t *tunnel) {
@@ -79,13 +83,11 @@ func (this *TunnelSet) CreateMasterTunnel() (t *tunnel) {
 	return
 }
 
-func CreateTunnelSet(creater func(string) (io.ReadWriteCloser, error)) (this *TunnelSet) {
+func CreateTunnelSet(creater func([]byte) (io.ReadWriteCloser, error)) (this *TunnelSet) {
 	this = &TunnelSet{
 		count:      1,
-		set:        make(map[uint64]*tunnel),
 		creater:    creater,
 		bufferPool: make(chan []byte, 4096),
-		closeChan:  make(chan uint64),
 	}
 	this.outSendLock.Lock()
 	return
@@ -107,7 +109,7 @@ func (this *TunnelSet) deleteBuf(buf []byte) {
 }
 
 func (this *TunnelSet) sendHeader(header uint32, tunnelId uint64) (err error) {
-	err = binary.Write(this.outConn, binary.LittleEndian, cHeaderError)
+	err = binary.Write(this.outConn, binary.LittleEndian, header)
 	if err != nil {
 		return
 	}
@@ -137,7 +139,7 @@ func (this *TunnelSet) sendError(tunnelId uint64, sendErr error) (err error) {
 	return
 }
 
-func (this *TunnelSet) reciveError(conn io.Reader, tunnelId uint64) (err error) {
+func (this *TunnelSet) reciveError(conn io.Reader, t *tunnel) (err error) {
 
 	var length uint32
 	err = binary.Read(conn, binary.LittleEndian, &length)
@@ -149,21 +151,24 @@ func (this *TunnelSet) reciveError(conn io.Reader, tunnelId uint64) (err error) 
 		return
 	}
 	buf := this.newBuf()
-	defer this.deleteBuf(buf)
+	defer func() {
+		this.deleteBuf(buf) //capture by pointer!
+	}()
 	if len(buf) < int(length) {
 		buf = make([]byte, length)
 	}
-	_, err = io.ReadFull(conn, buf)
+	_, err = io.ReadFull(conn, buf[:length])
 	if err != nil {
 		return
 	}
 
-	t := this.set[tunnelId]
-	if t != nil {
-		select {
-		case t.inError <- errors.New(string(buf)):
-		default:
-		}
+	if t == nil {
+		return
+	}
+
+	select {
+	case t.inError <- errors.New(string(buf)):
+	default:
 	}
 	return
 }
@@ -184,25 +189,24 @@ func (this *TunnelSet) sendStat(tunnelId uint64, stat uint32) (err error) {
 	return
 }
 
-func (this *TunnelSet) reciveStat(conn io.Reader, tunnelId uint64) (err error) {
+func (this *TunnelSet) reciveStat(conn io.Reader, t *tunnel) (err error) {
 	var stat uint32
 	err = binary.Read(conn, binary.LittleEndian, &stat)
 	if err != nil {
 		return
 	}
 
-	t := this.set[tunnelId]
 	if t == nil {
-		go func() {
-			this.sendError(tunnelId, errors.New("stat tunnel not found!"))
-		}()
-	} else {
-		select {
-		case t.statSignal <- struct{}{}:
-			atomic.StoreUint32(&t.statNumber, stat)
-		default:
-		}
+		err = errNotFound
+		return
 	}
+
+	select {
+	case t.statSignal <- struct{}{}:
+	default:
+		fmt.Println("stat number overwrited!")
+	}
+	atomic.StoreUint32(&t.statNumber, stat)
 	return
 }
 
@@ -222,26 +226,24 @@ func (this *TunnelSet) sendRead(tunnelId uint64, read uint32) (err error) {
 	return
 }
 
-func (this *TunnelSet) reciveRead(conn io.Reader, tunnelId uint64) (err error) {
+func (this *TunnelSet) reciveRead(conn io.Reader, t *tunnel) (err error) {
 	var readNum uint32
 	err = binary.Read(conn, binary.LittleEndian, &readNum)
 	if err != nil {
 		return
 	}
 
-	t := this.set[tunnelId]
 	if t == nil {
-		go func() {
-			this.sendError(tunnelId, errors.New("read tunnel not found!"))
-		}()
-	} else {
-		select {
-		case t.readSignal <- struct{}{}:
-			atomic.StoreUint32(&t.readNumber, readNum)
-		default:
-			fmt.Println("readNum duplicated!")
-		}
+		err = errNotFound
+		return
 	}
+
+	select {
+	case t.readSignal <- struct{}{}:
+	default:
+		fmt.Println("readNum overwrited!")
+	}
+	atomic.StoreUint32(&t.readNumber, readNum)
 	return
 }
 
@@ -259,19 +261,19 @@ func (this *TunnelSet) sendData(tunnelId uint64, p pack) (err error) {
 		return
 	}
 
-	if len(p.data) > int(MaxDataSize) {
+	if p.size > MaxDataSize {
 		panic("pack too large!")
 	}
 
-	err = binary.Write(this.outConn, binary.LittleEndian, uint32(len(p.data)))
+	err = binary.Write(this.outConn, binary.LittleEndian, p.size)
 	if err != nil {
 		return
 	}
-	_, err = this.outConn.Write(p.data)
+	_, err = this.outConn.Write(p.data[:p.size])
 	return
 }
 
-func (this *TunnelSet) reciveData(conn io.Reader, tunnelId uint64) (err error) {
+func (this *TunnelSet) reciveData(conn io.Reader, t *tunnel) (err error) {
 	var readNum uint32
 	err = binary.Read(conn, binary.LittleEndian, &readNum)
 	if err != nil {
@@ -288,46 +290,123 @@ func (this *TunnelSet) reciveData(conn io.Reader, tunnelId uint64) (err error) {
 		return
 	}
 
-	t := this.set[tunnelId]
 	if t == nil {
-		go func() {
-			this.sendError(tunnelId, errors.New("data tunnel not found!"))
-		}()
-	} else {
+		if len(this.DummyBuf) < int(length) {
+			this.DummyBuf = make([]byte, length)
+		}
+		_, err = io.ReadFull(conn, this.DummyBuf[:length])
+		if err == nil {
+			err = errNotFound
+		}
+		return
+	}
+
+	select {
+	case p := <-t.inEmptyBuf:
+
+		if len(p.data) < int(length) {
+			p.data = make([]byte, length)
+		}
+		p.size = length
+		p.readNum = readNum
+
+		_, err = io.ReadFull(conn, p.data[:p.size])
+		if err != nil {
+			return
+		}
+
 		select {
-		case p := <-t.inEmptyBuf:
+		case t.inFullBuf <- p:
 
-			if len(p.data) < int(length) {
-				p.data = make([]byte, length)
-			}
-
-			_, err = io.ReadFull(conn, p.data)
-			if err != nil {
-				return
-			}
-			p.readNum = readNum
-
-			select {
-			case t.inFullBuf <- p:
-
-			default:
-
-				select {
-				case t.inEmptyBuf <- p:
-				default:
-				}
-
-				fmt.Println("buffer chan full!")
-			}
 		default:
 
-			buf := make([]byte, length)
-			_, err = io.ReadFull(conn, buf)
-			if err != nil {
-				return
+			select {
+			case t.inEmptyBuf <- p:
+			default:
 			}
-			fmt.Println("out of buffer!")
+
+			fmt.Println("buffer chan full!")
 		}
+	default:
+
+		if len(this.DummyBuf) < int(length) {
+			this.DummyBuf = make([]byte, length)
+		}
+		_, err = io.ReadFull(conn, this.DummyBuf[:length])
+		fmt.Println("out of buffer!")
+	}
+	return
+}
+
+func (this *TunnelSet) sendCreate(tunnelId uint64, cmd []byte) (err error) {
+	this.outSendLock.Lock()
+	defer this.outSendLock.Unlock()
+
+	err = this.sendHeader(cHeaderError, tunnelId)
+	if err != nil {
+		return
+	}
+
+	if len(cmd) > int(MaxMessageSize) {
+		panic("create command too long!")
+	}
+	err = binary.Write(this.outConn, binary.LittleEndian, uint32(len(cmd)))
+	if err != nil {
+		return
+	}
+	_, err = this.outConn.Write(cmd)
+	return
+}
+
+func (this *TunnelSet) reciveCreate(conn io.Reader, t *tunnel, tunnelId uint64) (err error) {
+	var length uint32
+	err = binary.Read(conn, binary.LittleEndian, &length)
+	if err != nil {
+		return
+	}
+	if length > MaxMessageSize {
+		err = errors.New("command too large!")
+		return
+	}
+
+	buf := this.newBuf()
+	defer func() {
+		this.deleteBuf(buf)
+	}()
+	if len(buf) < int(length) {
+		buf = make([]byte, length)
+	}
+	_, err = io.ReadFull(conn, buf[:length])
+	if err != nil {
+		return
+	}
+
+	if this.creater == nil {
+		err = errors.New("not slave tunnelSet!")
+		return
+	}
+
+	subConn, subErr := this.creater(buf)
+	if subErr != nil {
+		go func() {
+			this.sendErrorLoop(tunnelId, subErr)
+		}()
+	} else {
+		if t != nil {
+			select {
+			case t.inError <- errors.New("tunnel overwrited!"):
+			default:
+			}
+		}
+		t = this.createTunnel()
+		this.tunnelMap.Store(tunnelId, t)
+		go func() {
+			defer this.tunnelMap.Delete(tunnelId)
+			err := this.runTunnel(subConn, tunnelId, t)
+			if err != nil && err.Error() != "EOF" {
+				fmt.Println(err)
+			}
+		}()
 	}
 	return
 }
@@ -359,58 +438,13 @@ func (this *TunnelSet) sendReadLoop(tunnelId uint64, read uint32) {
 	}
 }
 
-func (this *TunnelSet) reciveCreate(conn io.Reader, tunnelId uint64) (err error) {
-	var length uint32
-	err = binary.Read(conn, binary.LittleEndian, &length)
-	if err != nil {
-		return
+func (this *TunnelSet) sendCreateLoop(tunnelId uint64, cmd []byte) {
+	err := this.sendCreate(tunnelId, cmd)
+	for err != nil {
+		fmt.Println(err)
+		time.Sleep(time.Second)
+		err = this.sendCreate(tunnelId, cmd)
 	}
-	if length > MaxMessageSize {
-		err = errors.New("command too large!")
-		return
-	}
-
-	buf := this.newBuf()
-	defer this.deleteBuf(buf)
-	if len(buf) < int(length) {
-		buf = make([]byte, length)
-	}
-	_, err = io.ReadFull(conn, buf)
-	if err != nil {
-		return
-	}
-
-	if this.creater == nil {
-		err = errors.New("not slave tunnelSet!")
-		return
-	}
-
-	subConn, subErr := this.creater(string(buf))
-	if subErr != nil {
-		go func() {
-			this.sendErrorLoop(tunnelId, subErr)
-		}()
-	} else {
-		t := this.set[tunnelId]
-		if t != nil {
-			select {
-			case t.inError <- errors.New("tunnel overwrited!"):
-			default:
-			}
-		}
-		t = this.createTunnel()
-		this.set[tunnelId] = t
-		go func() {
-			defer func() {
-				this.closeChan <- tunnelId
-			}()
-			err := this.runTunnel(subConn, tunnelId, t)
-			if err != nil {
-				fmt.Println(err)
-			}
-		}()
-	}
-	return
 }
 
 func (this *TunnelSet) runTunnel(conn io.ReadWriteCloser, tunnelId uint64, t *tunnel) (err error) {
@@ -424,16 +458,15 @@ func (this *TunnelSet) runTunnel(conn io.ReadWriteCloser, tunnelId uint64, t *tu
 	}()
 
 	go func() {
+		var err error
 		next_htbt := func(stat uint32) {
 			time.Sleep(time.Second * 10)
 			t.htbtSignal <- stat
 		}
-		var n int
 		p := pack{
 			data:    make([]byte, 4096),
 			readNum: 0,
 		}
-		var msg [4]byte
 		for {
 			select {
 			case htbt := <-t.htbtSignal:
@@ -447,15 +480,17 @@ func (this *TunnelSet) runTunnel(conn io.ReadWriteCloser, tunnelId uint64, t *tu
 			case <-t.readSignal:
 				readNum := atomic.LoadUint32(&t.readNumber)
 				if p.readNum != readNum {
-					n, err = conn.Read(p.data)
+					length, err1 := conn.Read(p.data)
+					err = err1
 					p.readNum = readNum
+					p.size = uint32(length)
 				}
 
-				if n != 0 {
+				if p.size != 0 {
 					this.sendDataLoop(tunnelId, p)
 					go next_htbt(p.readNum)
-					if n == len(p.data) && n < int(MaxDataSize) {
-						ndata := make([]byte, n*2)
+					if int(p.size) == len(p.data) && p.size < MaxDataSize {
+						ndata := make([]byte, p.size*2)
 						for i, c := range p.data {
 							ndata[i] = c
 						}
@@ -511,16 +546,13 @@ func (this *TunnelSet) Connect(conn io.ReadWriter) (err error) {
 	this.outConnLock.Lock()
 	defer this.outConnLock.Unlock()
 	this.outConn = conn
+	defer func() {
+		this.outConn = nil
+	}()
 	this.outSendLock.Unlock()
 	defer this.outSendLock.Lock()
 
 	for {
-		select {
-		case id := <-this.closeChan:
-			delete(this.set, id)
-		default:
-		}
-
 		var header uint32
 		err = binary.Read(conn, binary.LittleEndian, &header)
 		if err != nil {
@@ -533,98 +565,55 @@ func (this *TunnelSet) Connect(conn io.ReadWriter) (err error) {
 			return
 		}
 
+		var t *tunnel
+		ti, ok := this.tunnelMap.Load(tunnelId)
+		if ok {
+			t = ti.(*tunnel)
+		}
+
 		switch header {
 		case cHeaderCreate:
-			err = this.reciveCreate(conn, tunnelId)
-			if err != nil {
-				return
-			}
-
+			err = this.reciveCreate(conn, t, tunnelId)
 		case cHeaderRead:
-			err = this.reciveRead(conn, tunnelId)
-			if err != nil {
-				return
-			}
-
+			err = this.reciveRead(conn, t)
 		case cHeaderStat:
-			err = this.reciveStat(conn, tunnelId)
-			if err != nil {
-				return
-			}
-
+			err = this.reciveStat(conn, t)
 		case cHeaderData:
-			err = this.reciveData(conn, tunnelId)
-			if err != nil {
-				return
-			}
-
+			err = this.reciveData(conn, t)
 		case cHeaderError:
-			err = this.reciveError(conn, tunnelId)
-			if err != nil {
-				return
-			}
+			err = this.reciveError(conn, t)
 		default:
 			err = errors.New("unknown header!")
-			return
+		}
+
+		if err != nil {
+			if err == errNotFound {
+				go this.sendErrorLoop(tunnelId, err)
+				err = nil
+			} else {
+				return
+			}
 		}
 	}
 }
 
-func (this *TunnelSet) createMasterTunnel() *tunnel {
-	this.lock.Lock()
-	defer this.lock.Unlock()
-	tunnelId := this.count
-	this.count++
+func (this *TunnelSet) ConnectTunnel(conn io.ReadWriteCloser, cmd []byte) (err error) {
 
-	this.set[tunnelId] = &tunnel{
-		conn: conn,
-	}
-
-	this.dataChan <- pack{
-		header: headerRead,
-	}
-	return
-}
-
-func newTunnel(conn io.ReadWriteCloser) (tunnelId uint64, tunnel *Tunnel) {
-
-	tunnelId = tunnelCount
-	tunnelCount++
-
-	tunnelMap[tunnelId] = &Tunnel{
-		Connetion: conn,
-	}
-	return
-}
-
-func deleteTunnel(tunnelId uint64) {
-	tunnelLock.Lock()
-	defer tunnelLock.Unlock()
-
-	tunnel, ok := tunnelMap[tunnelId]
-	if !ok {
-		return
-	}
-	if tunnel.Connetion != nil {
-		tunnel.Connetion.Close()
-		tunnel.Connetion = nil
-	}
-	delete(tunnelMap, tunnelId)
-}
-func putHeartbeat() (err error) {
-	outLock.Lock()
-	defer outLock.Unlock()
-
-	_, err = outConnection.Write([]byte(headerHeartbeat))
-	if err != nil {
+	if this.outConn == nil {
+		err = ErrNoConnection
 		return
 	}
 
-	_, err = getReply(outConnection)
-	return
-}
+	tunnelId := atomic.AddUint64(&this.count, 1)
+	t := this.createTunnel()
+	this.tunnelMap.Store(tunnelId, t)
+	defer this.tunnelMap.Delete(tunnelId)
 
-func OutConnectionStart(conn io.ReadWriter) (err error) {
-	outConnection = conn
-	outSignal = make(chan struct{})
+	this.sendCreateLoop(tunnelId, cmd)
+
+	err = this.runTunnel(conn, tunnelId, t)
+	if err != nil && err.Error() == "EOF" {
+		err = nil
+	}
+	return
 }
