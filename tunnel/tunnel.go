@@ -37,12 +37,23 @@ type pack struct {
 type tunnel struct {
 	inEmptyBuf chan pack
 	inFullBuf  chan pack
-	inError    chan error
+	inError_   chan error
 	statSignal chan struct{}
 	statNumber uint32
 	readSignal chan struct{}
 	readNumber uint32
-	htbtSignal chan uint32
+	closed     bool
+}
+
+func (this *tunnel) sendError(err error) {
+	select {
+	case this.inError_ <- err:
+	default:
+	}
+	this.closed = true
+	close(this.readSignal)
+	close(this.statSignal)
+	close(this.inFullBuf)
 }
 
 type TunnelSet struct {
@@ -61,10 +72,9 @@ func (this *TunnelSet) createTunnel() (t *tunnel) {
 	t = &tunnel{
 		inEmptyBuf: make(chan pack, 1),
 		inFullBuf:  make(chan pack, 1),
-		inError:    make(chan error, 1),
+		inError_:   make(chan error, 1),
 		statSignal: make(chan struct{}, 1),
 		readSignal: make(chan struct{}, 1),
-		htbtSignal: make(chan uint32, 1),
 	}
 	t.inEmptyBuf <- pack{
 		data: make([]byte, 4096),
@@ -156,10 +166,7 @@ func (this *TunnelSet) reciveError(conn io.Reader, t *tunnel) (err error) {
 		return
 	}
 
-	select {
-	case t.inError <- errors.New(string(buf)):
-	default:
-	}
+	t.sendError(errors.New(string(buf)))
 	return
 }
 
@@ -332,7 +339,7 @@ func (this *TunnelSet) sendCreate(tunnelId uint64, cmd []byte) (err error) {
 	this.outSendLock.Lock()
 	defer this.outSendLock.Unlock()
 
-	err = this.sendHeader(cHeaderError, tunnelId)
+	err = this.sendHeader(cHeaderCreate, tunnelId)
 	if err != nil {
 		return
 	}
@@ -383,10 +390,7 @@ func (this *TunnelSet) reciveCreate(conn io.Reader, t *tunnel, tunnelId uint64) 
 		}()
 	} else {
 		if t != nil {
-			select {
-			case t.inError <- errors.New("tunnel overwrited!"):
-			default:
-			}
+			t.sendError(errors.New("tunnel overwrited!"))
 		}
 		t = this.createTunnel()
 		this.tunnelMap.Store(tunnelId, t)
@@ -438,20 +442,20 @@ func (this *TunnelSet) sendCreateLoop(tunnelId uint64, cmd []byte) {
 }
 
 func (this *TunnelSet) runTunnel(conn io.ReadWriteCloser, tunnelId uint64, t *tunnel) (err error) {
+	closeSignal := make(chan struct{})
 	defer func() {
-		close(t.readSignal)
-		close(t.statSignal)
-		close(t.inError)
-		close(t.inFullBuf)
+		close(closeSignal)
 		close(t.inEmptyBuf)
 		conn.Close()
 	}()
 
 	go func() {
+		htbt := make(chan uint32)
+		defer close(htbt)
 		var err error
 		next_htbt := func(stat uint32) {
 			time.Sleep(time.Second * 10)
-			t.htbtSignal <- stat
+			htbt <- stat
 		}
 		p := pack{
 			data:    make([]byte, 4096),
@@ -459,7 +463,9 @@ func (this *TunnelSet) runTunnel(conn io.ReadWriteCloser, tunnelId uint64, t *tu
 		}
 		for {
 			select {
-			case htbt := <-t.htbtSignal:
+			case <-closeSignal:
+				return
+			case htbt := <-htbt:
 				if htbt == p.readNum {
 					err1 := this.sendStat(tunnelId, htbt)
 					if err1 != nil {
@@ -490,7 +496,10 @@ func (this *TunnelSet) runTunnel(conn io.ReadWriteCloser, tunnelId uint64, t *tu
 
 				if err != nil {
 					this.sendErrorLoop(tunnelId, err)
-					t.inError <- err
+					select {
+					case t.inError_ <- err:
+					default:
+					}
 					return
 				}
 			}
@@ -500,29 +509,41 @@ func (this *TunnelSet) runTunnel(conn io.ReadWriteCloser, tunnelId uint64, t *tu
 	readNum := uint32(1)
 	this.sendReadLoop(tunnelId, readNum)
 	for {
-		select {
-		case err = <-t.inError:
+		flush := func() {
 			select {
 			case p := <-t.inFullBuf:
+				defer func() {
+					t.inEmptyBuf <- p
+				}()
 				conn.Write(p.data)
 			default:
 			}
+		}
+		select {
+		case err = <-t.inError_:
+			flush()
 			return
 		case p := <-t.inFullBuf:
-			if len(p.data) == 0 {
-				return
-			}
-			if p.readNum == readNum {
-				_, err = conn.Write(p.data)
-				if err != nil {
-					this.sendErrorLoop(tunnelId, err)
+			func() {
+				defer func() {
+					t.inEmptyBuf <- p
+				}()
+				if p.size == 0 {
+					fmt.Println("closed pack!")
 					return
 				}
-				readNum++
-				this.sendReadLoop(tunnelId, readNum)
-			} else {
-				fmt.Println("unknown read number:", p.readNum)
-			}
+				if p.readNum == readNum {
+					_, err = conn.Write(p.data)
+					if err != nil {
+						this.sendErrorLoop(tunnelId, err)
+						return
+					}
+					readNum++
+					this.sendReadLoop(tunnelId, readNum)
+				} else {
+					fmt.Println("unknown read number:", p.readNum)
+				}
+			}()
 		case <-t.statSignal:
 			ir := atomic.LoadUint32(&t.statNumber)
 			if ir == readNum {

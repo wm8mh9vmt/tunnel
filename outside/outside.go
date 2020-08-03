@@ -154,6 +154,7 @@ func publicServer(port string, address string) {
 
 				err := tunnelSet.ConnectTunnel(conn, []byte(address))
 				if err != nil {
+					fmt.Println(err)
 					loger.Println(err)
 				}
 			}()
