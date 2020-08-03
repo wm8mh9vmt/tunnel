@@ -93,10 +93,10 @@ func privateServer() {
 	header := "tunne " + config.Secret
 	closeHeader := "close " + config.Secret
 	go func() {
-		defer func() {
-			err := recover()
-			fatal(err, "privateServer ")
-		}()
+		//defer func() {
+		//	err := recover()
+		//	fatal(err, "privateServer ")
+		//}()
 
 		for {
 			err := func() (err error) {
@@ -126,6 +126,7 @@ func privateServer() {
 				return
 			}()
 			if err != nil {
+				fmt.Println(err)
 				loger.Println(err)
 			}
 		}

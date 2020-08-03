@@ -76,6 +76,7 @@ func main() {
 	for {
 		err = connection()
 		if err != nil {
+			fmt.Println(err)
 			loger.Println(err)
 		}
 		time.Sleep(time.Second)
