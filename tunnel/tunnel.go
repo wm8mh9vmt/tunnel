@@ -42,6 +42,7 @@ type tunnel struct {
 	statNumber uint32
 	readSignal chan struct{}
 	readNumber uint32
+	heartbeat  chan time.Time
 }
 
 func (this *tunnel) sendError(err error) {
@@ -60,7 +61,8 @@ type TunnelSet struct {
 	outSendLock sync.Mutex
 	outConn     io.Writer
 	bufferPool  chan []byte
-	DummyBuf    []byte
+	dummyBuf_   []byte
+	closed      bool
 }
 
 func (this *TunnelSet) createTunnel() (t *tunnel) {
@@ -70,6 +72,7 @@ func (this *TunnelSet) createTunnel() (t *tunnel) {
 		inError_:   make(chan error, 1),
 		statSignal: make(chan struct{}, 1),
 		readSignal: make(chan struct{}, 1),
+		heartbeat:  make(chan time.Time, 1),
 	}
 	t.inEmptyBuf <- pack{
 		data: make([]byte, 4096),
@@ -85,7 +88,48 @@ func CreateTunnelSet(creater func([]byte) (io.ReadWriteCloser, error)) (this *Tu
 		bufferPool: make(chan []byte, 4096),
 	}
 	this.outSendLock.Lock()
+	go func() {
+		for {
+			if this.closed {
+				return
+			}
+			time.Sleep(time.Second * 10)
+			if this.outConn == nil {
+				continue
+			}
+			now := time.Now()
+
+			this.tunnelMap.Range(func(_, value interface{}) bool {
+				t := value.(*tunnel)
+				select {
+				case t.heartbeat <- now:
+				default:
+				}
+				return true
+			})
+		}
+
+	}()
 	return
+}
+
+func (this *TunnelSet) Close() {
+	this.tunnelMap.Range(func(_, value interface{}) bool {
+		t := value.(*tunnel)
+		select {
+		case t.inError_ <- errors.New("tunnel set closed"):
+		default:
+		}
+		this.closed = true
+		return true
+	})
+}
+
+func (this *TunnelSet) getDummy(size int) []byte {
+	if len(this.dummyBuf_) < size {
+		this.dummyBuf_ = make([]byte, size)
+	}
+	return this.dummyBuf_
 }
 
 func (this *TunnelSet) newBuf() (buf []byte) {
@@ -302,10 +346,7 @@ func (this *TunnelSet) reciveData(conn io.Reader, t *tunnel) (err error) {
 	}
 
 	if t == nil {
-		if len(this.DummyBuf) < int(length) {
-			this.DummyBuf = make([]byte, length)
-		}
-		_, err = io.ReadFull(conn, this.DummyBuf[:length])
+		_, err = io.ReadFull(conn, this.getDummy(int(length)))
 		if err == nil {
 			err = errNotFound
 		}
@@ -339,11 +380,7 @@ func (this *TunnelSet) reciveData(conn io.Reader, t *tunnel) (err error) {
 			fmt.Println("buffer chan full!")
 		}
 	default:
-
-		if len(this.DummyBuf) < int(length) {
-			this.DummyBuf = make([]byte, length)
-		}
-		_, err = io.ReadFull(conn, this.DummyBuf[:length])
+		_, err = io.ReadFull(conn, this.getDummy(int(length)))
 		fmt.Println("out of buffer!")
 	}
 	return
@@ -479,37 +516,30 @@ func (this *TunnelSet) runTunnel(conn io.ReadWriteCloser, tunnelId uint64, t *tu
 	}()
 
 	go func() {
-		htbt := make(chan uint32, 1)
 		var err error
-		next_htbt := func(stat uint32) {
-			go func() {
-				time.Sleep(time.Second * 10)
-				select {
-				case htbt <- stat:
-				default:
-				}
-			}()
-		}
 		p := pack{
 			data:    make([]byte, 4096),
 			readNum: 0,
 		}
+		var timeout time.Time
 		send := false
 		for {
 			select {
 			case <-closeSignal:
 				return
-			case htbt := <-htbt:
-				if htbt == p.readNum {
-					err1 := this.sendStat(tunnelId, htbt)
+			case now := <-t.heartbeat:
+				if send && now.After(timeout) {
+					err1 := this.sendStat(tunnelId, p.readNum)
 					if err1 != nil {
 						fmt.Println(err1)
 					}
-					next_htbt(htbt)
 				}
 			case <-t.readSignal:
 				readNum := atomic.LoadUint32(&t.readNumber)
 				if p.readNum != readNum {
+					if readNum-p.readNum != 1 {
+						fmt.Println("read number not consistent!")
+					}
 					length, err1 := conn.Read(p.data)
 					err = err1
 					p.readNum = readNum
@@ -519,10 +549,8 @@ func (this *TunnelSet) runTunnel(conn io.ReadWriteCloser, tunnelId uint64, t *tu
 
 				if p.size != 0 {
 					this.sendDataLoop(tunnelId, p)
-					if !send {
-						next_htbt(p.readNum)
-						send = true
-					}
+					send = true
+					timeout = time.Now().Add(time.Second * 10)
 					if int(p.size) == len(p.data) && p.size < MaxDataSize {
 						ndata := make([]byte, p.size*2)
 						for i, c := range p.data {
