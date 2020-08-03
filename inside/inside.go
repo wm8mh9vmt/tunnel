@@ -28,7 +28,8 @@ var (
 )
 
 func createTunnel(address []byte) (conn io.ReadWriteCloser, err error) {
-	conn, err = net.Dial("tcp", string(address))
+	s := string(address)
+	conn, err = net.Dial("tcp", s)
 	return
 }
 
