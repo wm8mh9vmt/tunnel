@@ -1,11 +1,13 @@
 package main
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
+	"math/rand"
 	"net"
 	"os"
 	"runtime"
@@ -31,7 +33,9 @@ var (
 	exit      chan struct{}
 	loger     *log.Logger
 	config    = new(Configure)
-	tunnelSet = tunnel.CreateTunnelSet(nil)
+	rnd       = rand.New(rand.NewSource(time.Now().UnixNano()))
+	tunnelSet *tunnel.TunnelSet
+	session   uint64
 )
 
 func fatal(err interface{}, where string) {
@@ -92,6 +96,7 @@ func privateServer() {
 	check(err)
 	header := "tunne " + config.Secret
 	closeHeader := "close " + config.Secret
+	start_signal := "start"
 	go func() {
 		//defer func() {
 		//	err := recover()
@@ -111,14 +116,45 @@ func privateServer() {
 				if err != nil {
 					return
 				}
-
 				if closeHeader == string(header_buf) {
 					exit <- struct{}{}
 					return
 				}
-
 				if header != string(header_buf) {
 					err = errors.New("wrong header!")
+					return
+				}
+
+				var remote_session uint64
+				err = binary.Read(conn, binary.LittleEndian, &remote_session)
+				if err != nil {
+					return
+				}
+
+				if tunnelSet == nil || session != remote_session {
+					if tunnelSet != nil {
+						tunnelSet.Close()
+					}
+					tunnelSet = tunnel.CreateTunnelSet(nil)
+					session = rnd.Uint64()
+					for session == remote_session || session == 0 {
+						session = rnd.Uint64()
+					}
+				}
+
+				err = binary.Write(conn, binary.LittleEndian, session)
+				if err != nil {
+					return
+				}
+
+				start_buf := make([]byte, len(start_signal))
+				_, err = io.ReadFull(conn, start_buf)
+				if err != nil {
+					return
+				}
+
+				if start_signal != string(start_buf) {
+					err = errors.New("wrong start signal!")
 					return
 				}
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -24,7 +25,8 @@ var (
 	exit      chan struct{}
 	loger     *log.Logger
 	config    = new(Configure)
-	tunnelSet = tunnel.CreateTunnelSet(createTunnel)
+	tunnelSet *tunnel.TunnelSet
+	session   uint64
 )
 
 func createTunnel(address []byte) (conn io.ReadWriteCloser, err error) {
@@ -95,6 +97,30 @@ func connection() (err error) {
 	_, err = conn.Write([]byte(header))
 	if err != nil {
 		return
+	}
+
+	err = binary.Write(conn, binary.LittleEndian, session)
+	if err != nil {
+		return
+	}
+
+	var remote_session uint64
+	err = binary.Read(conn, binary.LittleEndian, &remote_session)
+	if err != nil {
+		return
+	}
+
+	_, err = conn.Write([]byte("start"))
+	if err != nil {
+		return
+	}
+
+	if tunnelSet == nil || session != remote_session {
+		if tunnelSet != nil {
+			tunnelSet.Close()
+		}
+		tunnelSet = tunnel.CreateTunnelSet(createTunnel)
+		session = remote_session
 	}
 
 	err = tunnelSet.Connect(conn)

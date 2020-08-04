@@ -635,8 +635,6 @@ func (this *TunnelSet) Connect(conn io.ReadWriter) (err error) {
 	var header uint32
 	var tunnelId uint64
 	for {
-		header = 0
-		tunnelId = 0
 		err = binary.Read(conn, binary.LittleEndian, &header)
 		if err != nil {
 			return
