@@ -158,6 +158,7 @@ func privateServer() {
 					return
 				}
 
+				fmt.Println("connection established!")
 				err = tunnelSet.Connect(conn)
 				return
 			}()
@@ -188,6 +189,12 @@ func publicServer(port string, address string) {
 					err := recover()
 					fatal(err, "publicServer connection func")
 				}()
+
+				if tunnel == nil {
+					fmt.Println("no connection!")
+					loger.Println("no connection!")
+					return
+				}
 
 				err := tunnelSet.ConnectTunnel(conn, []byte(address))
 				if err != nil {

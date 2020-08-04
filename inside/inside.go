@@ -123,6 +123,7 @@ func connection() (err error) {
 		session = remote_session
 	}
 
+	fmt.Println("connection established!")
 	err = tunnelSet.Connect(conn)
 	return
 }
