@@ -13,17 +13,17 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/fixiong/tunnel/tunnel"
+	tunnel "github.com/fixiong/tunnel/tunnel"
 	"gopkg.in/yaml.v2"
 )
 
-type Tunnel struct {
+type TunnelConf struct {
 	Port    string
 	Address string
 }
 
 type Configure struct {
-	Mapping []Tunnel
+	Mapping []TunnelConf
 	Secret  string
 	Port    string
 }
