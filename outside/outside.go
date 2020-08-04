@@ -190,7 +190,7 @@ func publicServer(port string, address string) {
 					fatal(err, "publicServer connection func")
 				}()
 
-				if tunnel == nil {
+				if tunnelSet == nil {
 					fmt.Println("no connection!")
 					loger.Println("no connection!")
 					return
