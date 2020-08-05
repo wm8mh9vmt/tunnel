@@ -11,7 +11,7 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/fixiong/tunnel/tunnel"
+	tunnel "github.com/fixiong/tunnel/tunnel"
 	"gopkg.in/yaml.v2"
 )
 
@@ -69,7 +69,7 @@ func main() {
 	err = os.MkdirAll("log", os.ModePerm)
 	check(err)
 
-	logFileName := module + "_" + time.Now().Format("2006-01-02") + ".log"
+	logFileName := "./log/" + module + "_" + time.Now().Format("2006-01-02") + ".log"
 	logFile, err := os.Create(logFileName)
 	check(err)
 

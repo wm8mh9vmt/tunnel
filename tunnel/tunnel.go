@@ -598,11 +598,11 @@ func (this *TunnelSet) runTunnel(conn io.ReadWriteCloser, tunnelId uint64, t *Tu
 	go this.outLoop(conn, tunnelId, t, closeSignal)
 
 	t.ReadNum = uint32(1)
-	sendRead := func(num uint32, now time.Time) {
-		this.sendReadLoop(tunnelId, num)
+	sendRead := func(now time.Time) {
+		this.sendReadLoop(tunnelId, t.ReadNum)
 		t.LastRead = now
 	}
-	sendRead(t.ReadNum, time.Now())
+	sendRead(time.Now())
 	for {
 		flush := func() {
 			select {
@@ -620,8 +620,12 @@ func (this *TunnelSet) runTunnel(conn io.ReadWriteCloser, tunnelId uint64, t *Tu
 			return
 		case p := <-t.inFullBuf:
 			func() {
+				sr := false
 				defer func() {
 					t.inEmptyBuf <- p
+					if sr {
+						sendRead(time.Now())
+					}
 				}()
 				if p.Size == 0 {
 					fmt.Println("closed Pack!")
@@ -634,10 +638,10 @@ func (this *TunnelSet) runTunnel(conn io.ReadWriteCloser, tunnelId uint64, t *Tu
 						return
 					}
 					t.ReadNum++
-					sendRead(t.ReadNum, time.Now())
-					fmt.Println(
-						"Tunnel:", tunnelId,
-						"send read number:", t.ReadNum)
+					sr = true
+					//fmt.Println(
+					//	"Tunnel:", tunnelId,
+					//	"send read number:", t.ReadNum)
 				} else {
 					fmt.Println(
 						"Tunnel:", tunnelId,
@@ -680,7 +684,7 @@ func (this *TunnelSet) runTunnel(conn io.ReadWriteCloser, tunnelId uint64, t *Tu
 				}
 			}
 			if timeout {
-				sendRead(t.ReadNum, now)
+				sendRead(now)
 			}
 		}
 	}
