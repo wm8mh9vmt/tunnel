@@ -717,6 +717,8 @@ func (this *TunnelSet) Connect(conn io.ReadWriter) (err error) {
 		ti, ok := this.tunnelMap.Load(tunnelId)
 		if ok {
 			t = ti.(*Tunnel)
+		} else {
+			fmt.Println("tunnel not found:", tunnelId, "header:", header)
 		}
 
 		//fmt.Println("recive Tunnel:", tunnelId, "header:", header)
